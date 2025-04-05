@@ -1,0 +1,68 @@
+name: Bazel
+package: bazel
+index: about.html
+icon32x32: "www.gstatic.com/devrel-devsite/prod/vd31e3ed8994e05c7f2cd0cf68a402ca7902bb92b6ec0977d7ef2a1c699fae3f9/bazel/images/favicon-prod.png"
+allowJS: true
+ExternalURL: "https://bazel.build"
+walk_root: .
+docs_root: .
+# copy_dirs_into_docs:
+#   - bazel_site/fonts.gstatic.com
+#   - bazel_site/www.gstatic.com
+#   - bazel_site/fonts.googleapis.com
+css_selector_for_body: devsite-content
+css_selector_for_title: .devsite-page-title
+remove_elements:
+  - .devsite-actions
+  - devsite-feedback
+selectors:
+    - css: h2
+      type: Section
+      matchpath: .*/command-line-reference.html
+      toc_root: true
+    - css: dt a
+      type: Option
+      matchpath: .*/command-line-reference.html
+
+    - css: .devsite-page-title
+      type: Provider
+      matchpath: .*/rules/lib/(providers|core|fragments|globals|providers|toplevel)/.*.html
+      toc_root: true
+    - css: h2
+      type: Field
+      skiptext: Members
+      matchpath: .*/rules/lib/(providers|core|fragments|globals|providers|toplevel)/.*.html
+
+    # This includes all builtins (ctx, runfiles, etc)
+    - css: .devsite-page-title
+      type: Global
+      matchpath: .*/rules/lib/builtins/.*.html
+      toc_root: true
+    - css: h2
+      type: Field
+      matchpath: .*/rules/lib/builtins/.*.html
+      skiptext: Members
+      # Allows for searching for "ctx.actions" or "actions.run" in the index.
+      css_selector_for_search_prefix: .devsite-page-title
+
+    # This includes many of the workspace rules and lang-specific rules
+    - css: .devsite-page-title
+      type: Section
+      matchpath: .*/reference/be/.*.html
+      toc_root: true
+    - css: h2
+      type: Class
+      matchpath: .*/reference/be/.*.html
+
+# The following selectors are used if none of the above match.
+backup_selectors:
+  - css: .devsite-page-title
+    type: Guide
+    toc_root: true
+  - css: h2
+    type: Section
+    toc_root: true
+  - css: h3
+    type: Section
+    attr: id
+

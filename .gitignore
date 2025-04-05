@@ -1,7 +1,2 @@
-_vendor/
-busybox/busybox.docset
-dockerfile/dockerfile.docset
-foo.docset/
-dashing
-busybox.docset/
-vendor/
+versions
+docset_versions

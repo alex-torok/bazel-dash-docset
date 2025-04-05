@@ -3,24 +3,25 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"strings"
 	"text/template"
 
+	"github.com/andybalholm/cascadia"
 	css "github.com/andybalholm/cascadia"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 
 	_ "github.com/mattn/go-sqlite3"
+	"gopkg.in/yaml.v3"
 )
 
 const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -36,7 +37,7 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
 	<key>isDashDocset</key>
 	<true/>
 	<key>DashDocSetFamily</key>
-	<string>dashtoc</string>
+	<string>dashtoc3</string>
 	<key>dashIndexFilePath</key>
 	<string>{{.Index}}</string>
 	<key>isJavaScriptEnabled</key><{{.AllowJS}}/>{{if .ExternalURL}}
@@ -51,37 +52,113 @@ var version = "dev"
 
 type Dashing struct {
 	// The human-oriented name of the package.
-	Name string `json:"name"`
+	Name string `yaml:"name"`
 	// Computer-readable name. Recommendation is to use one word.
-	Package string `json:"package"`
+	Package string `yaml:"package"`
 	// The location of the index.html file.
-	Index string `json:"index"`
+	Index string `yaml:"index"`
 	// Selectors to match.
-	Selectors map[string]interface{} `json:"selectors"`
-	// Final form of the Selectors field.
-	selectors map[string][]*Transform `json:"-"`
-	// Entries that should be ignored.
-	Ignore []string `json:"ignore"`
+	Selectors []Transform `yaml:"selectors"`
+	// BackupSelectors - Used if none of the selectors match
+	BackupSelectors []Transform `yaml:"backup_selectors"`
+	// IgnorePathRegexes will cause any html file that matches from being pulled into the docs
+	IgnorePathRegexes []*regexp.Regexp `yaml:"ignore_path_regexes"`
+	// WalkRoot is the directory to start walking from.
+	WalkRoot string `yaml:"walk_root"`
+	// DocsRoot is the directory where the root of the http server is.
+	DocsRoot string `yaml:"docs_root"`
+	// CopyDirsIntoDocs is a list of directories to include in the docset.
+	CopyDirsIntoDocs []string `yaml:"copy_dirs_into_docs"`
+	// RemoveElements
+	RemoveElements []*cssSelectorYaml `yaml:"remove_elements"`
+	// A css selector for the body of the page. The first element that
+	// matches this will be used as the entirety of the page body.
+	CssSelectorForBody *cssSelectorYaml `yaml:"css_selector_for_body"`
+	// A css selector for the title of the page.
+	CssSelectorForTitle *cssSelectorYaml `yaml:"css_selector_for_title"`
 	// A 32x32 pixel PNG image.
-	Icon32x32 string `json:"icon32x32"`
-	AllowJS   bool   `json:"allowJS"`
+	Icon32x32 string `yaml:"icon32x32"`
+	AllowJS   bool   `yaml:"allowJS"`
 	// External URL for "Open Online Page"
-	ExternalURL string `json: "externalURL"`
+	ExternalURL string `yaml:"externalURL"`
+}
+
+func (d *Dashing) shouldIgnoreFile(src string) bool {
+	// Skip our own config file.
+	if filepath.Base(src) == "dashing.yaml" {
+		return true
+	}
+
+	for _, regex := range d.IgnorePathRegexes {
+		if regex.MatchString(src) {
+			return true
+		}
+	}
+
+	// Skip VCS dirs.
+	parts := strings.Split(src, "/")
+	for _, p := range parts {
+		switch p {
+		case ".git", ".svn":
+			return true
+		}
+	}
+	return false
+}
+
+// regexpYaml is a custom type that embeds *regexp.Regexp and implements UnmarshalYAML.
+type regexpYaml struct {
+	*regexp.Regexp
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface for regexpYaml.
+func (r *regexpYaml) UnmarshalYAML(value *yaml.Node) error {
+	pattern := value.Value
+	compiled, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("invalid regexp pattern '%s': %w", pattern, err)
+	}
+	r.Regexp = compiled
+	return nil
+}
+
+type cssSelectorYaml struct {
+	cascadia.Sel
+}
+
+func (c *cssSelectorYaml) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("expected scalar node for CSS selector, got %v", value.Kind)
+	}
+	selector, err := css.Parse(value.Value)
+	if err != nil {
+		return fmt.Errorf("invalid CSS selector '%s': %w", value.Value, err)
+	}
+	c.Sel = selector
+	return nil
+}
+
+func (c *cssSelectorYaml) MarshalYAML() (interface{}, error) {
+	// Marshal the CSS selector back to its string representation
+	if c.Sel == nil {
+		return "", fmt.Errorf("nil CSS selector cannot be marshaled")
+	}
+	return c.Sel.String(), nil
+	// Note: We don't need to handle errors here since UnmarshalYAML handles them.
 }
 
 // Transform is a description of what should be done with a selector.
-// When the Selectors map is unmarshaled, the values are turned into
-// Transform structs.
 type Transform struct {
-	Type        string
-	Attribute   string         // Use the value of this attribute as basis
-	Regexp      *regexp.Regexp // Perform a replace operation on the text
-	Replacement string
-	RequireText *regexp.Regexp // Require text matches the given regexp
-	MatchPath   *regexp.Regexp // Skip files that don't match this path
+	CssSelector                cssSelectorYaml  `yaml:"css"`                                      // The CSS selector to match elements
+	Type                       string           `yaml:"type"`                                     // The type of the element
+	Attribute                  string           `yaml:"attr,omitempty"`                           // Use the value of this attribute as basis
+	RequireText                *regexpYaml      `yaml:"requiretext,omitempty"`                    // Require text matches the given regexp
+	SkipText                   *regexpYaml      `yaml:"skiptext,omitempty"`                       // Skip this entry if the text matches this regexp
+	MatchPath                  *regexpYaml      `yaml:"matchpath,omitempty"`                      // Skip files that don't match this path
+	TOCRoot                    bool             `yaml:"toc_root,omitempty"`                       // If true, this entry is a root in the TOC
+	TOCChild                   bool             `yaml:"toc_child,omitempty"`                      // If true, this entry is a child in the TOC
+	CssSelectorForSearchPrefix *cssSelectorYaml `yaml:"css_selector_for_search_prefix,omitempty"` // If true, use the page title as a prefix in search results
 }
-
-var ignoreHash map[string]bool
 
 func main() {
 	app := cli.NewApp()
@@ -102,101 +179,24 @@ func commands() []*cli.Command {
 			Action: build,
 			Flags: []cli.Flag{
 				&cli.StringFlag{
-					Name:  "source, s",
-					Usage: "The path to the HTML files this will ingest. (Default: ./ )",
-				},
-				&cli.StringFlag{
 					Name:  "config, f",
-					Usage: "The path to the JSON configuration file.",
-				},
-			},
-		},
-		{
-			Name:   "update",
-			Usage:  "update a doc set",
-			Action: update,
-			Flags: []cli.Flag{
-				&cli.StringFlag{
-					Name:  "source, s",
-					Usage: "The path to the HTML files this will ingest. (Default: ./ )",
+					Usage: "The path to the YAML configuration file.",
 				},
 				&cli.StringFlag{
-					Name:  "config, f",
-					Usage: "The path to the JSON configuration file.",
-				},
-			},
-		},
-		{
-			Name:      "init",
-			Aliases:   []string{"create"},
-			Usage:     "create a new template for building documentation",
-			Action:    create,
-			Flags: []cli.Flag{
-				&cli.StringFlag{
-					Name:  "config, f",
-					Usage: "The path to the JSON configuration file.",
-				},
-			},
-		},
-		{
-			Name:   "version",
-			Usage:  "Print version and exit.",
-			Action: func(c *cli.Context) error {
-				fmt.Println(version)
-				return nil
-		        },
-			Flags: []cli.Flag{
-				&cli.StringFlag{
-					Name:  "config, f",
-					Usage: "The path to the JSON configuration file.",
+					Name:  "output, o",
+					Usage: "The output directory for the docset.",
 				},
 			},
 		},
 	}
-}
-
-func create(c *cli.Context) error {
-	f := c.String("config")
-	if len(f) == 0 {
-		f = "dashing.json"
-	}
-	conf := Dashing{
-		Name:    "Dashing",
-		Package: "dashing",
-		Index:   "index.html",
-		Selectors: map[string]interface{}{
-			"title": "Package",
-			"dt a":  "Command",
-		},
-		Ignore: []string{"ABOUT"},
-	}
-	j, err := json.MarshalIndent(conf, "", "    ")
-	if err != nil {
-		panic("The programmer did something dumb.")
-	}
-	err = ioutil.WriteFile(f, j, 0755)
-	if err != nil {
-		fmt.Errorf("Could not initialize JSON file: %s", err)
-		os.Exit(1)
-	}
-	fmt.Printf("You may now edit %s\n", f)
-	return nil
 }
 
 func build(c *cli.Context) error {
 	var dashing Dashing
 
-	source_depth := 0
-	source := c.String("source")
-	if len(source) == 0 {
-		source = "."
-	} else {
-		source_depth = len(strings.Split(source, "/"))
-	}
-
 	cf := strings.TrimSpace(c.String("config"))
 	if len(cf) == 0 {
-		cf = "./dashing.json"
+		cf = "./dashing.yaml"
 	}
 
 	conf, err := ioutil.ReadFile(cf)
@@ -205,171 +205,47 @@ func build(c *cli.Context) error {
 		os.Exit(1)
 	}
 
-	if err := json.Unmarshal(conf, &dashing); err != nil {
-		fmt.Printf("Failed to parse JSON: %s", err)
+	if err := yaml.Unmarshal(conf, &dashing); err != nil {
+		fmt.Printf("Failed to parse YAML: %s", err)
 		os.Exit(1)
-	}
-	if err := decodeSelectField(&dashing); err != nil {
-		fmt.Printf("Could not understand selector value: %s\n", err)
-		os.Exit(2)
 	}
 
 	name := dashing.Package
 
-	fmt.Printf("Building %s from files in '%s'.\n", name, source)
+	fmt.Printf("Building %s from files in '%s'.\n", name, dashing.WalkRoot)
 
-	os.MkdirAll(name+".docset/Contents/Resources/Documents/", 0755)
+	writer := newFileWriter(c.String("output"))
 
-	setIgnore(dashing.Ignore)
-	addPlist(name, &dashing)
+	addPlist(name, &dashing, writer)
 	if len(dashing.Icon32x32) > 0 {
-		addIcon(dashing.Icon32x32, name+".docset/icon.png")
+		err := writer.copyFile(path.Join(dashing.Icon32x32), "icon.png")
+		if err != nil {
+			fmt.Printf("Error copying icon: %s\n", err)
+		}
 	}
-	db, err := initDB(name, true)
+	db, err := writer.initDB(name)
 	if err != nil {
 		fmt.Printf("Failed to create database: %s\n", err)
 		return nil
 	}
 	defer db.Close()
-	texasRanger(source, source_depth, name, dashing, db)
+	texasRanger(dashing.WalkRoot, writer, dashing, db)
+
+	// for _, dir := range dashing.CopyDirsIntoDocs {
+	// 	fileSystem := os.DirFS(dir)
+	// 	fmt.Printf("Copying %s into docset\n", dir)
+	// 	// copyFS doesn't like existing files - clear it out
+	// 	os.RemoveAll(path.Join(destination, dir))
+	// 	err := os.CopyFS(path.Join(destination, dir), fileSystem)
+	// 	if err != nil {
+	// 		fmt.Printf("Error copying %s: %s\n", dir, err)
+	// 	}
+	// }
+
 	return nil
 }
 
-func update(c *cli.Context) error {
-	var dashing Dashing
-
-	source_depth := 0
-	source := c.String("source")
-	if len(source) == 0 {
-		source = "."
-	} else {
-		source_depth = len(strings.Split(source, "/"))
-	}
-
-	cf := strings.TrimSpace(c.String("config"))
-	if len(cf) == 0 {
-		cf = "./dashing.json"
-	}
-
-	conf, err := ioutil.ReadFile(cf)
-	if err != nil {
-		fmt.Printf("Failed to open configuration file '%s': %s (Run `dashing init`?)\n", cf, err)
-		os.Exit(1)
-	}
-
-	if err := json.Unmarshal(conf, &dashing); err != nil {
-		fmt.Printf("Failed to parse JSON: %s", err)
-		os.Exit(1)
-	}
-	if err := decodeSelectField(&dashing); err != nil {
-		fmt.Printf("Could not understand selector value: %s\n", err)
-		os.Exit(2)
-	}
-
-	name := dashing.Package
-
-	fmt.Printf("Building %s from files in '%s'.\n", name, source)
-
-	os.MkdirAll(name+".docset/Contents/Resources/Documents/", 0755)
-
-	setIgnore(dashing.Ignore)
-	addPlist(name, &dashing)
-	if len(dashing.Icon32x32) > 0 {
-		addIcon(dashing.Icon32x32, name+".docset/icon.png")
-	}
-	db, err := initDB(name, false)
-	if err != nil {
-		fmt.Printf("Failed to create database: %s\n", err)
-		return nil
-	}
-	defer db.Close()
-	texasRanger(source, source_depth, name, dashing, db)
-	return nil
-}
-
-func decodeSingleTransform(val map[string]interface{}) (*Transform, error) {
-	var ttype, trep, attr string
-	var creg, cmatchpath, requireText *regexp.Regexp
-	var err error
-
-	if r, ok := val["attr"]; ok {
-		attr = r.(string)
-	}
-
-	if r, ok := val["type"]; ok {
-		ttype = r.(string)
-	}
-	if r, ok := val["regexp"]; ok {
-		creg, err = regexp.Compile(r.(string))
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile regexp '%s': %s", r.(string), err)
-		}
-	}
-	if r, ok := val["replacement"]; ok {
-		trep = r.(string)
-	}
-	if r, ok := val["requiretext"]; ok {
-		requireText, err = regexp.Compile(r.(string))
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile regexp '%s': %s", r.(string), err)
-		}
-	}
-	if r, ok := val["matchpath"]; ok {
-		cmatchpath, err = regexp.Compile(r.(string))
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile regexp '%s': %s", r.(string), err)
-		}
-	}
-	return &Transform{
-		Type:        ttype,
-		Attribute:   attr,
-		Regexp:      creg,
-		Replacement: trep,
-		RequireText: requireText,
-		MatchPath:   cmatchpath,
-	}, nil
-}
-
-func decodeSelectField(d *Dashing) error {
-	d.selectors = make(map[string][]*Transform, len(d.Selectors))
-	for sel, val := range d.Selectors {
-		var trans *Transform
-		var err error
-		rv := reflect.Indirect(reflect.ValueOf(val))
-		if rv.Kind() == reflect.String {
-			trans = &Transform{
-				Type: val.(string),
-			}
-			d.selectors[sel] = append(d.selectors[sel], trans)
-		} else if rv.Kind() == reflect.Map {
-			val := val.(map[string]interface{})
-			if trans, err = decodeSingleTransform(val); err != nil {
-				return err
-			}
-			d.selectors[sel] = append(d.selectors[sel], trans)
-		} else if rv.Kind() == reflect.Slice {
-			for i := 0; i < rv.Len(); i++ {
-				element := rv.Index(i).Interface().(map[string]interface{})
-				if trans, err = decodeSingleTransform(element); err != nil {
-					return err
-				}
-				d.selectors[sel] = append(d.selectors[sel], trans)
-			}
-		} else {
-			return fmt.Errorf("Expected string or map. Kind is %s.", rv.Kind().String())
-		}
-	}
-	return nil
-}
-
-func setIgnore(i []string) {
-	ignoreHash = make(map[string]bool, len(i))
-	for _, item := range i {
-		ignoreHash[item] = true
-	}
-}
-
-func addPlist(name string, config *Dashing) {
+func addPlist(name string, config *Dashing, writer fileWriter) {
 	var file bytes.Buffer
 	t := template.Must(template.New("plist").Parse(plist))
 
@@ -396,90 +272,98 @@ func addPlist(name string, config *Dashing) {
 		fmt.Printf("Failed: %s\n", err)
 		return
 	}
-	ioutil.WriteFile(name+".docset/Contents/Info.plist", file.Bytes(), 0755)
-}
-
-func initDB(name string, fresh bool) (*sql.DB, error) {
-	dbname := name + ".docset/Contents/Resources/docSet.dsidx"
-
-	if fresh {
-		os.Remove(dbname)
-	}
-
-	db, err := sql.Open("sqlite3", dbname)
-	if err != nil {
-		return db, err
-	}
-
-	if fresh {
-		if _, err := db.Exec(`CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT)`); err != nil {
-			return db, err
-		}
-		if _, err := db.Exec(`CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path)`); err != nil {
-			return db, err
-		}
-	}
-
-	return db, nil
+	writer.WriteFile("Contents/Info.plist", file.Bytes(), 0755)
 }
 
 // texasRanger is... wait for it... a WALKER!
-func texasRanger(base string, base_depth int, name string, dashing Dashing, db *sql.DB) error {
+func texasRanger(base string, writer fileWriter, dashing Dashing, db *sql.DB) error {
 	filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
-		fmt.Printf("Reading %s\n", path)
-		if strings.HasPrefix(path, name+".docset") {
-			fmt.Printf("Ignoring directory %s\n", path)
-			return filepath.SkipDir
-		}
-		if info.IsDir() || ignore(path) {
+		if info.IsDir() || dashing.shouldIgnoreFile(path) {
 			return nil
 		}
-		dest := name + ".docset/Contents/Resources/Documents"
 		if htmlish(path) {
 			fmt.Printf("%s looks like HTML\n", path)
-			//if err := copyFile(path, name+".docset/Contents/Resources/Documents"); err != nil {
-			//fmt.Printf("Failed to copy file %s: %s\n", path, err)
-			//return err
-			//}
-			found, err := parseHTML(path, base_depth, dest, dashing)
+			result, err := parseHTML(path, dashing)
 			if err != nil {
 				fmt.Printf("Error parsing %s: %s\n", path, err)
 				return nil
 			}
-			for _, ref := range found {
-				fmt.Printf("Match: '%s' is type %s at %s\n", ref.name, ref.etype, ref.href)
-				db.Exec(`INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?,?,?)`, ref.name, ref.etype, ref.href)
+			for _, ref := range result.refs {
+				// the real path needs to be:
+				// <dash_entry_name=NAME><dash_entry_originalName=BUNDLE_NAME.NAME><dash_entry_menuDescription=BUNDLE_NAME>HTML_FILE#//dash_ref_NAME/TYPE/NAME/LEVEL>
+				path := fmt.Sprintf("<dash_entry_name=%s><dash_entry_originalName=%s><dash_entry_menuDescription=%s>%s", ref.name, ref.name, ref.menuDescription, ref.href)
+				fmt.Printf("Match(%s): '%s' is type %s at %s\n", ref.selector, ref.name, ref.etype, ref.href)
+				fmt.Println(path)
+				db.Exec(`INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?,?,?)`, ref.name, ref.etype, path)
 			}
+			writer.addHtml(path, result.htmlNode)
+			// for _, file := range result.usedFiles {
+			// 	if dashing.shouldIgnoreFile(file) {
+			// 		continue
+			// 	}
+			// 	err = copyFile(file, filepath.Join(destination, file))
+			// 	if err != nil {
+			// 		fmt.Printf("Error copying %s: %s\n", file, err)
+			// 	}
+			// }
+			return nil
 		} else {
-			// Or we just copy the file.
-			err := copyFile(path, filepath.Join(dest, path))
-			if err != nil {
-				fmt.Printf("Skipping file %s. Error: %s\n", path, err)
+			if dashing.shouldIgnoreFile(path) {
+				return nil
 			}
-			return err
+			err = writer.addContentFile(path)
+			// err = copyFile(path, filepath.Join(destination, path))
+			if err != nil {
+				fmt.Printf("Error copying %s: %s\n", path, err)
+			}
 		}
 		return nil
 	})
 	return nil
 }
 
-// ignore returns true if a file should be ignored by dashing.
-func ignore(src string) bool {
+func newFileWriter(destRoot string) fileWriter {
+	os.MkdirAll(path.Join(destRoot, "Contents/Resources"), 0755)
+	return fileWriter{destRoot: destRoot}
+}
 
-	// Skip our own config file.
-	if filepath.Base(src) == "dashing.json" {
-		return true
+type fileWriter struct {
+	destRoot string
+}
+
+func (w fileWriter) WriteFile(filename string, data []byte, perm os.FileMode) error {
+	return os.WriteFile(filepath.Join(w.destRoot, filename), data, perm)
+}
+
+func (w fileWriter) initDB(name string) (*sql.DB, error) {
+	dbname := path.Join(w.destRoot, "Contents/Resources/docSet.dsidx")
+
+	db, err := sql.Open("sqlite3", dbname)
+	if err != nil {
+		return db, err
 	}
 
-	// Skip VCS dirs.
-	parts := strings.Split(src, "/")
-	for _, p := range parts {
-		switch p {
-		case ".git", ".svn":
-			return true
-		}
+	if _, err := db.Exec(`CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT)`); err != nil {
+		return db, err
 	}
-	return false
+
+	if _, err := db.Exec(`CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path)`); err != nil {
+		return db, err
+	}
+
+	return db, nil
+}
+
+func (w fileWriter) addContentFile(src string) error {
+	return copyFile(src, filepath.Join(w.destRoot, "Contents/Resources/Documents", src))
+}
+
+func (w fileWriter) copyFile(src string, dest string) error {
+	return copyFile(src, filepath.Join(w.destRoot, dest))
+}
+
+func (w fileWriter) addHtml(src string, n *html.Node) error {
+	return writeHTML(src, filepath.Join(w.destRoot, "Contents/Resources/Documents"), n)
 }
 
 func encodeHTMLentities(orig string) string {
@@ -523,84 +407,184 @@ func htmlish(filename string) bool {
 }
 
 type reference struct {
-	name, etype, href string
+	selector, name, etype, href, menuDescription string
 }
 
-func parseHTML(path string, source_depth int, dest string, dashing Dashing) ([]*reference, error) {
-	refs := []*reference{}
+type parseResult struct {
+	refs      []*reference
+	usedFiles []string
+	htmlNode  *html.Node
+}
 
-	r, err := os.Open(path)
+func parseHTML(filepath string, dashing Dashing) (parseResult, error) {
+	r, err := os.Open(filepath)
 	if err != nil {
-		return refs, err
+		return parseResult{}, err
 	}
 	defer r.Close()
 	top, err := html.Parse(r)
+	if err != nil {
+		return parseResult{}, err
+	}
+
+	// head
+	headMatcher := css.MustCompile("head")
+	headNode := headMatcher.MatchFirst(top)
 
 	root := css.MustCompile("*[href],*[src]")
 	roots := root.MatchAll(top)
+	usedFiles := make([]string, 0)
 	for _, node := range roots {
-		for i, attribute := range node.Attr {
-			if "href" == attribute.Key || "src" == attribute.Key {
-				if strings.HasPrefix(attribute.Val, "/") {
-					// parts of the path - the file name - the source depth
-					path_depth := len(strings.Split(attribute.Val[1:], "/")) - 1 - source_depth
-					relative := ""
-					if path_depth > 0 {
-						strings.Repeat("../", path_depth)
-					}
-					node.Attr[i].Val = relative + attribute.Val[1:]
+		for _, attribute := range node.Attr {
+			if attribute.Key == "href" || attribute.Key == "src" {
+				url, err := url.Parse(attribute.Val)
+				if err != nil {
+					fmt.Printf("ERROR: %s: Error parsing URL '%s': %s\n", filepath, attribute.Val, err)
+					continue
+				}
+				if url.Scheme == "" && url.Host == "" && url.Path != "" {
+					// relative path
+					toCopy := path.Join(path.Dir(filepath), url.Path)
+					usedFiles = append(usedFiles, toCopy)
 				}
 				break
 			}
 		}
 	}
 
-	for pattern, sels := range dashing.selectors {
-		for _, sel := range sels {
-			// Skip this selector if file path doesn't match
-			if sel.MatchPath != nil && !sel.MatchPath.MatchString(path) {
-				continue
+	for _, selector := range dashing.RemoveElements {
+		for _, node := range css.Selector(selector.Sel.Match).MatchAll(top) {
+			node.Parent.RemoveChild(node)
+		}
+	}
+
+	if dashing.CssSelectorForBody != nil {
+		// head
+		bodyMatcher := css.MustCompile("body")
+		bodyNode := bodyMatcher.MatchFirst(top)
+
+		bodyNodeContent := css.Selector(dashing.CssSelectorForBody.Sel.Match).MatchFirst(top)
+
+		if bodyNodeContent == nil {
+			fmt.Printf("ERROR: No body found matching '%s' in %s\n", dashing.CssSelectorForBody.String(), filepath)
+		} else {
+			bodyNodeContent.Parent.RemoveChild(bodyNodeContent)
+			bodyNodeContent.Attr = append(bodyNodeContent.Attr, html.Attribute{Key: "style", Val: "max-width: 100%;"})
+			// make a new body node
+			newBodyNode := &html.Node{
+				Type:     html.ElementNode,
+				DataAtom: atom.Body,
+				Data:     atom.Body.String(),
+				Attr:     bodyNode.Attr,
 			}
+			newBodyNode.AppendChild(bodyNodeContent)
+			bodyNode.Parent.InsertBefore(newBodyNode, bodyNode)
+			bodyNode.Parent.RemoveChild(bodyNode)
+		}
+	}
 
-			m := css.MustCompile(pattern)
-			found := m.MatchAll(top)
-			for _, n := range found {
-				textString := text(n)
-				if sel.RequireText != nil && !sel.RequireText.MatchString(textString) {
-					fmt.Printf("Skipping entry for '%s' (Text not matching given regexp '%v')\n", textString, sel.RequireText)
-					continue
-				}
-				var name string
-				if len(sel.Attribute) != 0 {
-					name = attr(n, sel.Attribute)
-				} else {
-					name = textString
-				}
+	refs := findRefs(top, dashing.Selectors, dashing, filepath, headNode)
+	if len(refs) == 0 {
+		refs = findRefs(top, dashing.BackupSelectors, dashing, filepath, headNode)
+	}
+	return parseResult{
+		refs:      refs,
+		usedFiles: usedFiles,
+		htmlNode:  top,
+	}, nil
+}
 
-				// Skip things explicitly ignored.
-				if ignored(name) {
-					fmt.Printf("Skipping entry for %s (Ignored by dashing JSON)\n", name)
-					continue
-				}
+func findRefs(top *html.Node, selectors []Transform, dashing Dashing, filepath string, headNode *html.Node) []*reference {
+	refs := []*reference{}
+	// tocHeaderName := ""
 
-				// If we have a regexp, run it.
-				if sel.Regexp != nil {
-					name = sel.Regexp.ReplaceAllString(name, sel.Replacement)
-				}
+	titleString := ""
+	if dashing.CssSelectorForTitle != nil {
+		title := css.Selector(dashing.CssSelectorForTitle.Sel.Match).MatchFirst(top)
+		if title != nil {
+			titleString = text(title)
+		}
+	}
 
-				// References we want to track.
-				refs = append(refs, &reference{name, sel.Type, path + "#" + anchor(n)})
-				// We need to modify the DOM with a special link to support TOC.
-				n.Parent.InsertBefore(newA(name, sel.Type), n)
+	matchingSelectors := make([]*Transform, 0)
+	for _, sel := range selectors {
+		// Skip this selector if file path doesn't match
+		if sel.MatchPath == nil {
+			matchingSelectors = append(matchingSelectors, &sel)
+		} else {
+			if sel.MatchPath.MatchString(filepath) {
+				matchingSelectors = append(matchingSelectors, &sel)
 			}
 		}
 	}
-	return refs, writeHTML(path, dest, top)
-}
 
-func ignored(n string) bool {
-	_, ok := ignoreHash[n]
-	return ok
+	for n := range top.Descendants() {
+		for _, sel := range matchingSelectors {
+			if !sel.CssSelector.Match(n) {
+				continue
+			}
+
+			textString := text(n)
+			if sel.RequireText != nil && !sel.RequireText.MatchString(textString) {
+				fmt.Printf("Skipping entry for '%s' (Text not matching given regexp '%v')\n", textString, sel.RequireText)
+				continue
+			}
+
+			if sel.SkipText != nil && sel.SkipText.MatchString(textString) {
+				fmt.Printf("Skipping entry for '%s' (Text matches skip regexp '%v')\n", textString, sel.SkipText)
+				continue
+			}
+
+			var name string
+			if len(sel.Attribute) != 0 {
+				name = attr(n, sel.Attribute)
+			} else {
+				name = textString
+			}
+
+			prefix := ""
+			if sel.CssSelectorForSearchPrefix != nil {
+				node := css.Query(top, sel.CssSelectorForSearchPrefix)
+				if node != nil {
+					nodeText := text(node)
+					// Only set prefix if it's different from the current name
+					// This saves us from having a prefix like "prefix.prefix.name"
+					if nodeText != textString {
+						prefix = fmt.Sprintf("%s.", nodeText)
+					}
+				}
+			}
+
+			if !strings.HasSuffix(filepath, "-2.html") {
+				linkHref := attr(n, "href")
+				if !strings.HasPrefix(linkHref, "#") || len(linkHref) == 0 {
+					linkHref = "#" + attr(n, "id")
+				}
+				// if len(linkHref) == 0 and {
+				// linkHref = fmt.Sprintf(":~:text=%s", url.QueryEscape(name))
+				// linkHref = anchor(n)
+				// }
+				refs = append(refs,
+					&reference{
+						selector:        sel.CssSelector.String(),
+						name:            prefix + name,
+						etype:           sel.Type,
+						href:            filepath + linkHref,
+						menuDescription: titleString,
+					},
+				)
+			}
+
+			// if sel.TOCRoot {
+			// 	tocHeaderName = name
+			// }
+
+			tocAnchor, linkNode := tocAnchorAndLinkNode(name, sel.Type, sel.TOCRoot)
+			headNode.AppendChild(linkNode)
+			n.Parent.InsertBefore(tocAnchor, n)
+		}
+	}
+	return refs
 }
 
 func text(node *html.Node) string {
@@ -643,42 +627,58 @@ func anchor(node *html.Node) string {
 	return tname
 }
 
-//autolink creates an A tag for when one is not present in original docs.
+// autolink creates an A tag for when one is not present in original docs.
 func autolink(target string) *html.Node {
 	return &html.Node{
 		Type:     html.ElementNode,
 		DataAtom: atom.A,
 		Data:     atom.A.String(),
 		Attr: []html.Attribute{
-			html.Attribute{Key: "class", Val: "dashingAutolink"},
-			html.Attribute{Key: "name", Val: target},
+			{Key: "class", Val: "dashingAutolink"},
+			{Key: "name", Val: target},
 		},
 	}
 }
 
-// newA creates a TOC anchor.
-func newA(name, etype string) *html.Node {
+var counter = 0
+
+func tocAnchorAndLinkNode(name, etype string, isSectionHeader bool) (*html.Node, *html.Node) {
 	name = strings.Replace(url.QueryEscape(name), "+", "%20", -1)
 
-	target := fmt.Sprintf("//apple_ref/cpp/%s/%s", etype, name)
-	return &html.Node{
-		Type:     html.ElementNode,
-		DataAtom: atom.A,
-		Data:     atom.A.String(),
-		Attr: []html.Attribute{
-			html.Attribute{Key: "class", Val: "dashAnchor"},
-			html.Attribute{Key: "name", Val: target},
-		},
+	tocLevel := 0 // default level for children
+	if isSectionHeader {
+		tocLevel = 1 // root level
 	}
-}
+	target := fmt.Sprintf("//dash_ref_%d/%s/%s/%d", counter, etype, name, tocLevel)
+	counter++
 
-// addIcon adds an icon to the docset.
-func addIcon(src, dest string) error {
-	return copyFile(src, dest)
+	return &html.Node{
+			Type:     html.ElementNode,
+			DataAtom: atom.A,
+			Data:     atom.A.String(),
+			Attr: []html.Attribute{
+				{Key: "class", Val: "dashAnchor"},
+				{Key: "name", Val: target},
+			},
+		}, &html.Node{
+			Type:     html.ElementNode,
+			DataAtom: atom.Link,
+			Data:     atom.Link.String(),
+			Attr: []html.Attribute{
+				{Key: "href", Val: target},
+			},
+		}
 }
 
 // copyFile copies a source file to a new destination.
 func copyFile(src, dest string) error {
+	// if dest exists already, no-op
+	if _, err := os.Stat(dest); err == nil {
+		return nil
+	}
+
+	fmt.Printf("Copying %s\n to %s\n", src, dest)
+
 	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return err
 	}
@@ -740,7 +740,6 @@ var point_to_entity = map[rune]string{
 	8249: "&lsaquo;",
 	8250: "&rsaquo;",
 	8764: "&sim;",
-	// 62:   "&gt;",	// this is already encoded for us
 	8629: "&crarr;",
 	9824: "&spades;",
 	8260: "&frasl;",
@@ -754,7 +753,6 @@ var point_to_entity = map[rune]string{
 	8804: "&le;",
 	8805: "&ge;",
 	9830: "&diams;",
-	// 38:   "&amp;",	// this is already encoded for us
 	8834: "&sub;",
 	8835: "&sup;",
 	8836: "&nsub;",
@@ -810,7 +808,7 @@ var point_to_entity = map[rune]string{
 	202:  "&Ecirc;",
 	203:  "&Euml;",
 	204:  "&Igrave;",
-	// 34:   "&quot;",	// this is already encoded
+	205:  "&Iacute;",
 	206:  "&Icirc;",
 	207:  "&Iuml;",
 	208:  "&ETH;",
@@ -838,7 +836,6 @@ var point_to_entity = map[rune]string{
 	230:  "&aelig;",
 	231:  "&ccedil;",
 	232:  "&egrave;",
-	205:  "&Iacute;",
 	234:  "&ecirc;",
 	235:  "&euml;",
 	236:  "&igrave;",
@@ -858,6 +855,7 @@ var point_to_entity = map[rune]string{
 	250:  "&uacute;",
 	251:  "&ucirc;",
 	252:  "&uuml;",
+	// '/':  "%252F", // Escape forward slash for URLs in hrefs
 	253:  "&yacute;",
 	254:  "&thorn;",
 	255:  "&yuml;",
@@ -882,7 +880,6 @@ var point_to_entity = map[rune]string{
 	352:  "&Scaron;",
 	353:  "&scaron;",
 	8593: "&uarr;",
-	// 60:   "&lt;",	// this is already encoded for us
 	8594: "&rarr;",
 	8707: "&exist;",
 	8595: "&darr;",

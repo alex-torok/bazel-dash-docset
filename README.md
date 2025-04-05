@@ -1,195 +1,38 @@
-# Dashing: Generate Dash documentation from HTML
-[![Stability: Maintenance](https://masterminds.github.io/stability/maintenance.svg)](https://masterminds.github.io/stability/maintenance.html)
+# Dash Bazel Docs Gen
 
+This repo contains the code necessary for generating [Dash](https://kapeli.com/dash)
+docsets for bazel. The code for creating the docset started as a fork of
+[Dashing](https://github.com/technosophos/dashing)
 
-Dashing is a general purpose tool for starting with some HTML
-documentation and generating Dash documentation.
+## Running it locally
 
-Dashing uses CSS3 selectors to tag an HTML document for import into
-Dash. It generates a complete docset for you.
+**Install Requirements**
 
-This supports the following Dash features:
-
-- Index pages
-- Custom icon
-- Table of Contents auto-generation
-
-See:
-https://kapeli.com/docsets
-
-## INSTALL
-
-There are several ways to install this program.
-
-For most people, the easiest way is through [Homebrew:](https://brew.sh/)
+The docset generator requires `httrack` to download the docs and a working golang installation
+to generate the docset.
 
 ```
-brew install dashing
+brew install httrack
 ```
 
-Or [MacPorts:](https://www.macports.org/)
+**Scrape the site and generate all versions of docs**
 
 ```
-sudo port install dashing
+./scrape_all_docs.sh
+./build_all_docs.sh
 ```
 
-Prebuilt OSX 64-bit binaries are also available here:
-https://github.com/technosophos/dashing/releases
+## How it works
 
-If you have Go 1.4 or later installed, simply run:
+Bazel's docs are versioned in the [bazel
+repo](https://github.com/bazelbuild/bazel) and consist of a mixture of
+automatically-generated HTML and user-written markdown files.
 
-```
-go get -u github.com/technosophos/dashing
-```
+The site is published with google's internal devsite infrastructure, so
+it is not possible to build the HTML for the site entirely locally. To
+get around that limitation, we use the [open-source `httrack`
+CLI](https://www.httrack.com/) to archive the site and all of its dependencies
+locally.
 
-Dashing will now be located at `$GOPATH/bin/dashing`.
-
-A prebuilt binary is also available as a GitHub release.
-
-## USAGE
-
-To get started, `cd` to the directory that you want to generate
-documentation inside.
-
-```
-$ cd mydocs
-$ dashing create
-# Now you can edit dashing.json. See below.
-$ dashing build mydocs
-```
-
-You will now have a directory called `mydocs.docset` that contains all
-the documentation you need for Dash.
-
-For more, run `dashing help`.
-
-## dashing.json Format
-
-The basic Dashing format looks like this:
-
-```json
-{
-    "name": "Dashing",
-    "package": "dashing",
-    "index":"index.html",
-    "icon32x32": "icon.png",
-    "externalURL": "https://github.com/technosophos/dashing",
-    "selectors": {
-        "dt a": "Command",
-        "title": "Package"
-    },
-    "ignore": [
-        "ABOUT"
-    ]
-}
-```
-
-- name: Human-oriented name of the package
-- package: Computer-oriented name of the package (one word recommended)
-- index: Default index file in the existing docs
-- icon32x32: a 32x32 pixel PNG icon
-- externalURL: the base URL of the docs
-- selectors: a map of selectors. There is a simple format and
-  a more advanced format (see below for details).
-- ignore: a list of matches to be ignored (see below)
-
-Dashing uses CSS 3 selectors to map patterns in a document to Dash
-sections. You tell Dashing which patterns in HTML map to which Dash data
-type. The list of Dash data types can be found here: https://kapeli.com/docsets#supportedentrytypes.
-
-```json
-{
-  "selectors": {
-    "h1 a": "Package",
-    "h2.classdef a": "Class",
-  }
-}
-```
-
-The above will look for `h1 a` combinations, and treat those as package
-definitions, and `h2 class="classdef" a` combinations and treat those as
-Class definitions.
-
-## Ignoring Sections You Don't Care About
-
-On occasion, you'll have to manually ignore some matched text bits. To
-do that, you can use the `ignores` directive in the JSON file:
-
-
-```json
-{
-  "selectors": {
-    "h1 a": "Package",
-    "h2.classdef a": "Class",
-  },
-  "ignore": ["DESCRIPTION", "MORE"]
-}
-```
-
-The above will ignore anything whose text matches the exact text "DESCRIPTION"
-or "MORE", even if the selectors match.
-
-## Other Mappers/Filters on Selectors
-
-Instead of using a simple mapping of selector to type, you have the
-option to map/filter the selected results.
-
-The format for this extended type of `selectors` looks like this:
-
-```json
-{
-    "name": "BusyBox",
-    "package":"busybox",
-    "index":"BusyBox.html",
-    "icon32x32":"busybox1.png",
-    "selectors": {
-        "dt a": "Command",
-        "title": {
-          "type":"Package",
-          "regexp": " - The Swiss Army Knife of Embedded Linux",
-          "replacement": "",
-          "matchpath": "doc/.*\\.html"
-        }
-    },
-    "ignore": [
-        "ABOUT"
-    ]
-}
-```
-
-The format of the selector value is:
-
-```json
-"css selector": {
-      "requiretext": "require that the text matches a regexp. If not, this node is not considered as selected",
-      "type": "Dash data type",
-      "attr": "Use the value of the specified attribute instead of html node text as the basis for transformation",
-      "regexp": "PCRE regular expression (no need to enclose in //)",
-      "replacement": "Replacement text for each match of 'regexp'",
-      "matchpath": "Only files matching this regular expression will be parsed. Will match all files if not set."
-}
-```
-
-And you can have multiple transformations specified for the same css selector:
-
-```json
-"css selector": [
-    {
-        "requiretext": "...",
-        "type": "..."
-    },
-    {
-        "requiretext": "...",
-        "type": "..."
-    }
-]
-```
-
-The above allows you to fine tweak nodes selected via css selectors using
-their text contents.
-
-Full documentation on the regular expression format can be found here:
-http://golang.org/pkg/regexp/syntax/
-
-Documentation on the format for `replacement` can be found here:
-http://golang.org/pkg/regexp/#Regexp.ReplaceAllString
+Once the site is archived locally, the go tool is used to crawl the html files
+and build up the dash docset.

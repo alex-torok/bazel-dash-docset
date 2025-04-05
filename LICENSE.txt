@@ -1,3 +1,5 @@
+Dash Bazel Docs Generator
+Copyright (C) 2025, Alex Torok
 Dashing
 Copyright (C) 2015, Matt Butcher
 
