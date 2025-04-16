@@ -29,12 +29,12 @@ function build_docset {
 
     tar --exclude='.DS_Store' -cvzf $output_dir/bazel.tgz $output_dir/bazel.docset
 
-    version_dir="$version"
+    version_dir="versions/$version"
     if [[ "$version" == "latest" ]]; then
         version_dir=""
     fi
 
-    docset_dest="$repo_root/../Dash-User-Contributions/docsets/bazel/versions/$version_dir"
+    docset_dest="$repo_root/../Dash-User-Contributions/docsets/bazel/$version_dir"
     mkdir -p "$docset_dest"
 
     cp "$output_dir/bazel.tgz" "$docset_dest/bazel.tgz"
