@@ -27,7 +27,7 @@ function build_docset {
         --output "$output_dir/bazel.docset" \
         --version "$version"
 
-    tar --exclude='.DS_Store' -cvzf $output_dir/bazel.tgz $output_dir/bazel.docset
+    tar --exclude='.DS_Store' -cvzf $output_dir/bazel.tgz -C $output_dir bazel.docset
 
     version_dir="versions/$version"
     if [[ "$version" == "latest" ]]; then

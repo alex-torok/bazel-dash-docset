@@ -24,6 +24,7 @@ function scrape_version {
         "+fonts.googleapis.com/*" \
         "+*.gstatic.com/*" \
         "-bazel.build/*" \
+        "+bazel.build/_pwa/*" \
         "+bazel.build/versions/$version/*" \
         "+bazel.build/*.css" \
         "-*?hl=*"

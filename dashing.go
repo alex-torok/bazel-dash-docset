@@ -297,6 +297,10 @@ func texasRanger(base string, writer fileWriter, dashing Dashing, db *sql.DB) er
 				path := fmt.Sprintf("<dash_entry_name=%s><dash_entry_originalName=%s><dash_entry_menuDescription=%s>%s", ref.name, ref.name, ref.menuDescription, ref.href)
 				fmt.Printf("Match(%s): '%s' is type %s at %s\n", ref.selector, ref.name, ref.etype, ref.href)
 				fmt.Println(path)
+				if ref.name == "" {
+					fmt.Printf("ERROR: No name found %+v\n", ref)
+					continue
+				}
 				db.Exec(`INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?,?,?)`, ref.name, ref.etype, path)
 			}
 			writer.addHtml(path, result.htmlNode)
@@ -590,10 +594,6 @@ func findRefs(top *html.Node, selectors []Transform, dashing Dashing, filepath s
 					},
 				)
 			}
-
-			// if sel.TOCRoot {
-			// 	tocHeaderName = name
-			// }
 
 			tocAnchor, linkNode := tocAnchorAndLinkNode(name, sel.Type, sel.TOCRoot)
 			headNode.AppendChild(linkNode)
