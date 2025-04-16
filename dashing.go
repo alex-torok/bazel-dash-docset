@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
@@ -47,9 +46,6 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 `
 
-// Automatically replaced by linker.
-var version = "dev"
-
 type Dashing struct {
 	// The human-oriented name of the package.
 	Name string `yaml:"name"`
@@ -81,6 +77,8 @@ type Dashing struct {
 	AllowJS   bool   `yaml:"allowJS"`
 	// External URL for "Open Online Page"
 	ExternalURL string `yaml:"externalURL"`
+
+	docsetVersion string
 }
 
 func (d *Dashing) shouldIgnoreFile(src string) bool {
@@ -164,7 +162,6 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "dashing"
 	app.Usage = "Generate Dash documentation from HTML files"
-	app.Version = version
 
 	app.Commands = commands()
 
@@ -186,6 +183,10 @@ func commands() []*cli.Command {
 					Name:  "output, o",
 					Usage: "The output directory for the docset.",
 				},
+				&cli.StringFlag{
+					Name:  "version",
+					Usage: "The bazel docset version",
+				},
 			},
 		},
 	}
@@ -199,7 +200,7 @@ func build(c *cli.Context) error {
 		cf = "./dashing.yaml"
 	}
 
-	conf, err := ioutil.ReadFile(cf)
+	conf, err := os.ReadFile(cf)
 	if err != nil {
 		fmt.Printf("Failed to open configuration file '%s': %s (Run `dashing init`?)\n", cf, err)
 		os.Exit(1)
@@ -209,6 +210,8 @@ func build(c *cli.Context) error {
 		fmt.Printf("Failed to parse YAML: %s", err)
 		os.Exit(1)
 	}
+
+	dashing.docsetVersion = c.String("version")
 
 	name := dashing.Package
 
@@ -483,6 +486,18 @@ func parseHTML(filepath string, dashing Dashing) (parseResult, error) {
 		}
 	}
 
+	titleElem := css.MustCompile("title").MatchFirst(top)
+	if titleElem != nil {
+		titleText := text(titleElem)
+		titleText = strings.Replace(titleText, "  |  Bazel", "", 1)
+		// Dash only wants you to include the version in the title if it is for a specific version
+		if dashing.docsetVersion != "latest" {
+			titleText = fmt.Sprintf("%s | %s", titleText, dashing.docsetVersion)
+		}
+		// Update the text inside of the <title> element
+		titleElem.FirstChild.Data = titleText
+	}
+
 	refs := findRefs(top, dashing.Selectors, dashing, filepath, headNode)
 	if len(refs) == 0 {
 		refs = findRefs(top, dashing.BackupSelectors, dashing, filepath, headNode)
@@ -503,6 +518,7 @@ func findRefs(top *html.Node, selectors []Transform, dashing Dashing, filepath s
 		title := css.Selector(dashing.CssSelectorForTitle.Sel.Match).MatchFirst(top)
 		if title != nil {
 			titleString = text(title)
+
 		}
 	}
 

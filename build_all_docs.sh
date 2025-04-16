@@ -24,9 +24,20 @@ function build_docset {
 
     go run ../../dashing.go build \
         --config "$repo_root/config.yaml" \
-        --output "$output_dir/bazel.docset"
+        --output "$output_dir/bazel.docset" \
+        --version "$version"
 
-    tar -czf $output_dir/bazel.tgz $output_dir/bazel.docset
+    tar --exclude='.DS_Store' -cvzf $output_dir/bazel.tgz $output_dir/bazel.docset
+
+    version_dir="$version"
+    if [[ "$version" == "latest" ]]; then
+        version_dir=""
+    fi
+
+    docset_dest="$repo_root/../Dash-User-Contributions/docsets/bazel/versions/$version_dir"
+    mkdir -p "$docset_dest"
+
+    cp "$output_dir/bazel.tgz" "$docset_dest/bazel.tgz"
 
     popd
 }
