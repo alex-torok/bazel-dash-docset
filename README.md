@@ -15,6 +15,9 @@ to generate the docset.
 brew install httrack
 ```
 
+The scripts expect that you have a clone of the `Dash-User-Contributions` repo
+in a sibling directory of this repo's clone.
+
 **Scrape the site and generate all versions of docs**
 
 ```
